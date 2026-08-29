@@ -1,24 +1,5 @@
 """
 Custom Gymnasium environment simulating Battlesnake rules, for RL training.
-
-This does NOT depend on any external Battlesnake library — the rules are
-simple enough (and stable/well-documented) that we implement them directly.
-This means training runs entirely locally with no network calls, no server,
-and no fragile third-party dependency in the loop.
-
-Rules implemented (standard Battlesnake ruleset, simplified to 1v1):
-  - Grid board (default 11x11, matches the standard competitive size)
-  - Each snake starts at health 100, loses 1 health per turn
-  - Eating food resets health to 100 and grows the snake by 1
-  - A snake dies if it: runs out of health, hits a wall, hits its own body,
-    hits the opponent's body, or (on a head-to-head collision) is not the
-    longer snake
-  - New food spawns periodically at a random empty cell
-
-This is "single-agent" from the trainee's point of view: our snake is
-controlled by the RL policy, the opponent by a simple heuristic (see
-opponent_policy below) — swap in a stronger opponent, or self-play, once
-the basic pipeline is working.
 """
 
 import random
@@ -44,9 +25,39 @@ _DELTAS = {
 }
 
 
+def flood_fill_size(start, occupied, board_size, cap=None):
+    """
+    Breadth-first count of cells reachable from `start` without crossing
+    a wall or an occupied cell. Standalone so both training and serving
+    use the exact same logic.
+    """
+    if start in occupied or not (0 <= start[0] < board_size and 0 <= start[1] < board_size):
+        return 0
+    cap = cap or (board_size * board_size)
+    seen = {start}
+    queue = [start]
+    count = 0
+    head = 0
+    while head < len(queue) and count < cap:
+        x, y = queue[head]
+        head += 1
+        count += 1
+        for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+            nx, ny = x + dx, y + dy
+            if (
+                0 <= nx < board_size
+                and 0 <= ny < board_size
+                and (nx, ny) not in occupied
+                and (nx, ny) not in seen
+            ):
+                seen.add((nx, ny))
+                queue.append((nx, ny))
+    return count
+
+
 class Snake:
     def __init__(self, body, health=100):
-        self.body = list(body)  # list of (x, y), body[0] is the head
+        self.body = list(body)
         self.health = health
         self.alive = True
 
@@ -60,24 +71,28 @@ class Snake:
 
 
 class BattlesnakeEnv(gym.Env):
-    """
-    Single-agent Gymnasium env: our snake vs one heuristic opponent snake,
-    on a standard-size board.
-    """
-
     metadata = {"render_modes": ["ansi"]}
 
-    def __init__(self, board_size=11, max_turns=300, opponent_policy=None):
+    def __init__(self, board_size=11, max_turns=300, opponent_policy=None, opponent_policies=None, opponent_weights=None):
         super().__init__()
         self.board_size = board_size
         self.max_turns = max_turns
-        self.opponent_policy = opponent_policy or self._default_opponent_policy
 
-        # Observation: a fixed-size feature vector describing the local
-        # situation around our snake's head, plus some global info.
-        # See _get_obs() for exactly what's encoded — kept simple to start.
-        self.observation_space = Box(low=-1.0, high=1.0, shape=(20,), dtype=np.float32)
-        self.action_space = Discrete(4)  # UP, DOWN, LEFT, RIGHT
+        if opponent_policy is not None:
+            self._fixed_opponent_policy = opponent_policy
+            self._opponent_policy_pool = None
+        else:
+            self._fixed_opponent_policy = None
+            self._opponent_policy_pool = opponent_policies or [
+                self._random_safe_opponent_policy,
+                self._food_seeking_opponent_policy,
+                self._flood_fill_opponent_policy,
+            ]
+        self._opponent_weights = opponent_weights
+        self.opponent_policy = self._fixed_opponent_policy or self._random_safe_opponent_policy
+
+        self.observation_space = Box(low=-1.0, high=1.0, shape=(24,), dtype=np.float32)
+        self.action_space = Discrete(4)
 
         self.turn = 0
         self.food = set()
@@ -88,8 +103,11 @@ class BattlesnakeEnv(gym.Env):
         super().reset(seed=seed)
         self.turn = 0
         mid = self.board_size // 2
+        if self._fixed_opponent_policy is None:
+            self.opponent_policy = random.choices(
+                self._opponent_policy_pool, weights=self._opponent_weights, k=1
+            )[0]
 
-        # Start the two snakes on opposite sides of the board.
         self.us = Snake(body=[(2, mid), (1, mid), (0, mid)])
         self.opponent = Snake(body=[(self.board_size - 3, mid), (self.board_size - 2, mid), (self.board_size - 1, mid)])
 
@@ -115,9 +133,7 @@ class BattlesnakeEnv(gym.Env):
 
         return self._get_obs(), reward, terminated, truncated, {}
 
-    # ---- internals ----
-
-    def _apply_move(self, snake: Snake, move: Move):
+    def _apply_move(self, snake, move):
         if not snake.alive:
             return
         dx, dy = _DELTAS[move]
@@ -136,24 +152,19 @@ class BattlesnakeEnv(gym.Env):
             if not snake.alive:
                 continue
             hx, hy = snake.head
-            # Wall collision
             if not (0 <= hx < self.board_size and 0 <= hy < self.board_size):
                 snake.alive = False
                 continue
-            # Starvation
             if snake.health <= 0:
                 snake.alive = False
                 continue
-            # Self collision (head hit own body, excluding the head itself)
             if snake.head in snake.body[1:]:
                 snake.alive = False
                 continue
-            # Collision with other snake's body (excluding other's head — handled below)
             if other.alive and snake.head in other.body[1:]:
                 snake.alive = False
                 continue
 
-        # Head-to-head collision: shorter snake (or equal length) dies.
         if self.us.alive and self.opponent.alive and self.us.head == self.opponent.head:
             if self.us.length <= self.opponent.length:
                 self.us.alive = False
@@ -173,8 +184,6 @@ class BattlesnakeEnv(gym.Env):
             self.food.add(cell)
 
     def _maybe_spawn_food(self):
-        # Roughly matches official Battlesnake's food spawn cadence: spawn
-        # if below a minimum count, otherwise spawn with a small chance each turn.
         if len(self.food) < 1:
             self._spawn_food(count=1)
         elif random.random() < 0.15:
@@ -183,71 +192,71 @@ class BattlesnakeEnv(gym.Env):
     def _calc_reward(self):
         reward = 0.0
         if not self.us.alive and not self.opponent.alive:
-            reward = 0.0  # simultaneous death, draw
+            reward = 0.0
         elif not self.us.alive:
-            reward = -10.0  # we died
+            reward = -10.0
         elif not self.opponent.alive:
-            reward = 10.0  # opponent died, we win
+            reward = 10.0
         else:
-            reward = 0.01  # small per-turn survival incentive
+            reward = 0.01
         return reward
 
-    def _get_obs(self):
-        """
-        Encodes, from our snake's point of view:
-          - Danger in each of the 4 directions (wall/body collision next turn): 4 values
-          - Direction to nearest food (dx, dy, normalized): 2 values
-          - Direction to opponent's head (dx, dy, normalized): 2 values
-          - Our health / 100, opponent health / 100: 2 values
-          - Our length, opponent length (normalized by board_size): 2 values
-          - Which direction is directly toward the board center (dx, dy, normalized): 2 values
-          - Padding for future features: remaining slots filled with 0
+    def _flood_fill_size(self, start, occupied, cap=None):
+        return flood_fill_size(start, occupied, self.board_size, cap=cap)
 
-        Kept intentionally simple to get an end-to-end pipeline training
-        fast. See README "Next steps" for how to expand this (e.g. a small
-        local grid patch around the head instead of just danger flags).
-        """
-        obs = np.zeros(20, dtype=np.float32)
+    def _get_obs(self):
+        obs = np.zeros(24, dtype=np.float32)
 
         hx, hy = self.us.head
-        occupied = set(self.us.body) | set(self.opponent.body)
+        our_occupied = set(self.us.body) | set(self.opponent.body)
+        floodfill_occupied = (set(self.us.body[:-1]) | set(self.opponent.body[:-1])) - {(hx, hy)}
 
         for i, move in enumerate([Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]):
             dx, dy = _DELTAS[move]
             nx, ny = hx + dx, hy + dy
             danger = (
                 not (0 <= nx < self.board_size and 0 <= ny < self.board_size)
-                or (nx, ny) in occupied
+                or (nx, ny) in our_occupied
             )
             obs[i] = 1.0 if danger else 0.0
 
-        if self.food:
-            fx, fy = min(self.food, key=lambda f: abs(f[0] - hx) + abs(f[1] - hy))
-            obs[4] = np.clip((fx - hx) / self.board_size, -1, 1)
-            obs[5] = np.clip((fy - hy) / self.board_size, -1, 1)
+            space = self._flood_fill_size((nx, ny), floodfill_occupied, cap=30)
+            obs[4 + i] = min(space / 30.0, 1.0)
+
+        food_sorted = sorted(self.food, key=lambda f: abs(f[0] - hx) + abs(f[1] - hy))
+        if len(food_sorted) >= 1:
+            fx, fy = food_sorted[0]
+            obs[8] = np.clip((fx - hx) / self.board_size, -1, 1)
+            obs[9] = np.clip((fy - hy) / self.board_size, -1, 1)
+        if len(food_sorted) >= 2:
+            fx2, fy2 = food_sorted[1]
+            obs[10] = np.clip((fx2 - hx) / self.board_size, -1, 1)
+            obs[11] = np.clip((fy2 - hy) / self.board_size, -1, 1)
 
         ox, oy = self.opponent.head
-        obs[6] = np.clip((ox - hx) / self.board_size, -1, 1)
-        obs[7] = np.clip((oy - hy) / self.board_size, -1, 1)
+        obs[12] = np.clip((ox - hx) / self.board_size, -1, 1)
+        obs[13] = np.clip((oy - hy) / self.board_size, -1, 1)
 
-        obs[8] = self.us.health / 100.0
-        obs[9] = self.opponent.health / 100.0
-        obs[10] = self.us.length / (self.board_size * self.board_size)
-        obs[11] = self.opponent.length / (self.board_size * self.board_size)
+        obs[14] = self.us.health / 100.0
+        obs[15] = self.opponent.health / 100.0
+        obs[16] = self.us.length / (self.board_size * self.board_size)
+        obs[17] = self.opponent.length / (self.board_size * self.board_size)
 
         mid = self.board_size / 2
-        obs[12] = np.clip((mid - hx) / self.board_size, -1, 1)
-        obs[13] = np.clip((mid - hy) / self.board_size, -1, 1)
+        obs[18] = np.clip((mid - hx) / self.board_size, -1, 1)
+        obs[19] = np.clip((mid - hy) / self.board_size, -1, 1)
+
+        opp_would_lose = self.opponent.length < self.us.length
+        for i, move in enumerate([Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]):
+            dx, dy = _DELTAS[move]
+            nx, ny = hx + dx, hy + dy
+            opp_could_reach = abs(nx - ox) + abs(ny - oy) == 1
+            obs[20 + i] = 1.0 if (opp_could_reach and not opp_would_lose) else 0.0
 
         return obs
 
     @staticmethod
-    def _default_opponent_policy(env, opponent: Snake, other: Snake):
-        """
-        Simple heuristic opponent: pick a random move that doesn't
-        immediately kill it (wall/self/other-body collision), if one
-        exists; otherwise pick randomly (it's going to die anyway).
-        """
+    def _random_safe_opponent_policy(env, opponent, other):
         hx, hy = opponent.head
         occupied = set(opponent.body) | set(other.body)
         safe_moves = []
@@ -257,6 +266,45 @@ class BattlesnakeEnv(gym.Env):
             if 0 <= nx < env.board_size and 0 <= ny < env.board_size and (nx, ny) not in occupied:
                 safe_moves.append(move)
         return random.choice(safe_moves) if safe_moves else random.choice(list(Move))
+    @staticmethod
+    def _food_seeking_opponent_policy(env, opponent, other):
+        hx, hy = opponent.head
+        occupied = set(opponent.body) | set(other.body)
+        safe_moves = []
+        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            dx, dy = _DELTAS[move]
+            nx, ny = hx + dx, hy + dy
+            if 0 <= nx < env.board_size and 0 <= ny < env.board_size and (nx, ny) not in occupied:
+                safe_moves.append(move)
+        if not safe_moves:
+            return random.choice(list(Move))
+        if not env.food:
+            return random.choice(safe_moves)
+        fx, fy = min(env.food, key=lambda f: abs(f[0] - hx) + abs(f[1] - hy))
+        return min(safe_moves, key=lambda m: abs((hx + _DELTAS[m][0]) - fx) + abs((hy + _DELTAS[m][1]) - fy))
+    @staticmethod
+    def _flood_fill_opponent_policy(env, opponent, other):
+        hx, hy = opponent.head
+        occupied = set(opponent.body) | set(other.body)
+        safe_moves = []
+        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            dx, dy = _DELTAS[move]
+            nx, ny = hx + dx, hy + dy
+            if 0 <= nx < env.board_size and 0 <= ny < env.board_size and (nx, ny) not in occupied:
+                safe_moves.append(move)
+        if not safe_moves:
+            return random.choice(list(Move))
+        floodfill_occupied = (set(opponent.body[:-1]) | set(other.body[:-1])) - {(hx, hy)}
+        def space_then_food(m):
+            nx, ny = hx + _DELTAS[m][0], hy + _DELTAS[m][1]
+            space = flood_fill_size((nx, ny), floodfill_occupied, env.board_size, cap=30)
+            if env.food:
+                fx, fy = min(env.food, key=lambda f: abs(f[0] - nx) + abs(f[1] - ny))
+                food_dist = abs(nx - fx) + abs(ny - fy)
+            else:
+                food_dist = 0
+            return (space, -food_dist)
+        return max(safe_moves, key=space_then_food)
 
     def render(self):
         grid = [["." for _ in range(self.board_size)] for _ in range(self.board_size)]

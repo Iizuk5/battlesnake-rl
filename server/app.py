@@ -10,34 +10,36 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
+import torch
 from flask import Flask, request, jsonify
 from stable_baselines3 import PPO
+
+from env.battlesnake_env import BattlesnakeEnv
 
 app = Flask(__name__)
 
 MOVE_NAMES = ["up", "down", "left", "right"]
 
 
-def load_model(model_path: str):
+def load_model(weights_path: str):
     global model
-    model = PPO.load(model_path)
+    dummy_env = BattlesnakeEnv()
+    model = PPO("MlpPolicy", dummy_env, device="cpu")
+    state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
+    model.policy.load_state_dict(state_dict)
+    model.policy.eval()
     return model
 
 
-_default_model_path = os.environ.get(
-    "MODEL_PATH",
-    os.path.join(os.path.dirname(__file__), "..", "models", "ppo_battlesnake.zip"),
+_default_weights_path = os.environ.get(
+    "WEIGHTS_PATH",
+    os.path.join(os.path.dirname(__file__), "..", "models", "policy_weights.pth"),
 )
 model = None
-if os.path.exists(_default_model_path):
-    import hashlib
-    size = os.path.getsize(_default_model_path)
-    with open(_default_model_path, "rb") as f:
-        checksum = hashlib.sha256(f.read()).hexdigest()
-    print(f"[diagnostic] model file: {_default_model_path}", flush=True)
-    print(f"[diagnostic] size: {size} bytes", flush=True)
-    print(f"[diagnostic] sha256: {checksum}", flush=True)
-    load_model(_default_model_path)
+if os.path.exists(_default_weights_path):
+    print(f"[diagnostic] weights file: {_default_weights_path}", flush=True)
+    print(f"[diagnostic] size: {os.path.getsize(_default_weights_path)} bytes", flush=True)
+    load_model(_default_weights_path)
 
 
 def board_to_obs(data):
@@ -125,11 +127,11 @@ def end():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="models/ppo_battlesnake.zip")
+    parser.add_argument("--weights", type=str, default="models/policy_weights.pth")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
 
-    load_model(args.model)
+    load_model(args.weights)
     app.run(host="0.0.0.0", port=args.port)
 
 

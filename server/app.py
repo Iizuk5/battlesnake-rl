@@ -14,7 +14,7 @@ import torch
 from flask import Flask, request, jsonify
 from stable_baselines3 import PPO
 
-from env.battlesnake_env import BattlesnakeEnv
+from env.battlesnake_env import BattlesnakeEnv, flood_fill_size
 
 app = Flask(__name__)
 
@@ -62,34 +62,50 @@ def board_to_obs(data):
 
     food = [(f["x"], f["y"]) for f in board["food"]]
 
-    obs = np.zeros(20, dtype=np.float32)
+    obs = np.zeros(24, dtype=np.float32)
     hx, hy = my_body[0]
-    occupied = set(my_body) | set(opp_body)
+    our_occupied = set(my_body) | set(opp_body)
+    floodfill_occupied = (set(my_body[:-1]) | set(opp_body[:-1])) - {(hx, hy)}
 
     deltas = {"up": (0, 1), "down": (0, -1), "left": (-1, 0), "right": (1, 0)}
     for i, direction in enumerate(["up", "down", "left", "right"]):
         dx, dy = deltas[direction]
         nx, ny = hx + dx, hy + dy
-        danger = not (0 <= nx < board_size and 0 <= ny < board_size) or (nx, ny) in occupied
+        danger = not (0 <= nx < board_size and 0 <= ny < board_size) or (nx, ny) in our_occupied
         obs[i] = 1.0 if danger else 0.0
 
-    if food:
-        fx, fy = min(food, key=lambda f: abs(f[0] - hx) + abs(f[1] - hy))
-        obs[4] = np.clip((fx - hx) / board_size, -1, 1)
-        obs[5] = np.clip((fy - hy) / board_size, -1, 1)
+        space = flood_fill_size((nx, ny), floodfill_occupied, board_size, cap=30)
+        obs[4 + i] = min(space / 30.0, 1.0)
+
+    food_sorted = sorted(food, key=lambda f: abs(f[0] - hx) + abs(f[1] - hy))
+    if len(food_sorted) >= 1:
+        fx, fy = food_sorted[0]
+        obs[8] = np.clip((fx - hx) / board_size, -1, 1)
+        obs[9] = np.clip((fy - hy) / board_size, -1, 1)
+    if len(food_sorted) >= 2:
+        fx2, fy2 = food_sorted[1]
+        obs[10] = np.clip((fx2 - hx) / board_size, -1, 1)
+        obs[11] = np.clip((fy2 - hy) / board_size, -1, 1)
 
     ox, oy = opp_body[0]
-    obs[6] = np.clip((ox - hx) / board_size, -1, 1)
-    obs[7] = np.clip((oy - hy) / board_size, -1, 1)
+    obs[12] = np.clip((ox - hx) / board_size, -1, 1)
+    obs[13] = np.clip((oy - hy) / board_size, -1, 1)
 
-    obs[8] = you["health"] / 100.0
-    obs[9] = opp_health / 100.0
-    obs[10] = len(my_body) / (board_size * board_size)
-    obs[11] = len(opp_body) / (board_size * board_size)
+    obs[14] = you["health"] / 100.0
+    obs[15] = opp_health / 100.0
+    obs[16] = len(my_body) / (board_size * board_size)
+    obs[17] = len(opp_body) / (board_size * board_size)
 
     mid = board_size / 2
-    obs[12] = np.clip((mid - hx) / board_size, -1, 1)
-    obs[13] = np.clip((mid - hy) / board_size, -1, 1)
+    obs[18] = np.clip((mid - hx) / board_size, -1, 1)
+    obs[19] = np.clip((mid - hy) / board_size, -1, 1)
+
+    opp_would_lose = len(opp_body) < len(my_body)
+    for i, direction in enumerate(["up", "down", "left", "right"]):
+        dx, dy = deltas[direction]
+        nx, ny = hx + dx, hy + dy
+        opp_could_reach = abs(nx - ox) + abs(ny - oy) == 1
+        obs[20 + i] = 1.0 if (opp_could_reach and not opp_would_lose) else 0.0
 
     return obs
 
@@ -117,6 +133,9 @@ def move():
     data = request.get_json()
     obs = board_to_obs(data)
     action, _ = model.predict(obs, deterministic=True)
+    print(f"[move-debug] raw request: {data}", flush=True)
+    print(f"[move-debug] computed obs: {obs.tolist()}", flush=True)
+    print(f"[move-debug] chosen action: {int(action)} ({MOVE_NAMES[int(action)]})", flush=True)
     return jsonify({"move": MOVE_NAMES[int(action)]})
 
 

@@ -30,6 +30,13 @@ _default_model_path = os.environ.get(
 )
 model = None
 if os.path.exists(_default_model_path):
+    import hashlib
+    size = os.path.getsize(_default_model_path)
+    with open(_default_model_path, "rb") as f:
+        checksum = hashlib.sha256(f.read()).hexdigest()
+    print(f"[diagnostic] model file: {_default_model_path}", flush=True)
+    print(f"[diagnostic] size: {size} bytes", flush=True)
+    print(f"[diagnostic] sha256: {checksum}", flush=True)
     load_model(_default_model_path)
 
 
